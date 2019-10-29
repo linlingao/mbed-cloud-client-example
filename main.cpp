@@ -19,6 +19,9 @@
 #include "simplem2mclient.h"
 #ifdef TARGET_LIKE_MBED
 #include "mbed.h"
+#include "sensors/icm20602_i2c.h"
+#include "sensors/VL53L0X.h"
+#include "sensors/Si7021.h"
 #endif
 #include "application_init.h"
 #include "mcc_common_button_and_led.h"
@@ -56,12 +59,34 @@ static M2MResource* button_res;
 static M2MResource* pattern_res;
 static M2MResource* blink_res;
 static M2MResource* unregister_res;
+static volatile uint32_t sample_time_ms = 1000;
+static M2MResource* distance_res;
+static M2MResource* accel_x_res;
+static M2MResource* accel_y_res;
+static M2MResource* accel_z_res;
+
+static M2MResource* sample_rate_res;
+
+DigitalOut sensor_power(PIN_NAME_SENSOR_POWER_ENABLE);
+DevI2C i2c(PIN_NAME_SDA, PIN_NAME_SCL);
+ICM20602 icm20602;
+DigitalOut interrupt_pin(PIN_NAME_INT_LIGHT_TOF);
+VL53L0X vl53l0x(&i2c, &interrupt_pin, PIN_NAME_INT_LIGHT_TOF, VL53L0X_DEFAULT_ADDRESS);
+VL53L0X_RangingMeasurementData_t ToF_data;
+Si7021 si7021;
 
 void unregister_received(void);
 void unregister(void);
 
 // Pointer to mbedClient, used for calling close function.
 static SimpleM2MClient *client;
+
+static void sample_time_updated(void *)
+{
+    float rate = sample_rate_res->get_value_float();
+    sample_time_ms = rate * 1000;
+    printf("Setting sample time to %f\r\n", rate);
+}
 
 void pattern_updated(const char *)
 {
@@ -227,6 +252,25 @@ void main_application(void)
 #endif
 
 #ifndef MCC_MEMORY
+    /* Initialize Sensors */
+    sensor_power = 1; // power for I2C bus on EP_AGORA
+    icm20602.init(&i2c); // accelerometer
+    vl53l0x.init_sensor(VL53L0X_DEFAULT_ADDRESS); // ToF sensor
+
+    accel_x_res = mbedClient.add_cloud_resource(3313, 0, 5702, "accel_x_resource", M2MResourceInstance::FLOAT,
+                                                    M2MBase::GET_ALLOWED, 0, true, NULL, NULL);
+    accel_y_res = mbedClient.add_cloud_resource(3313, 0, 5703, "accel_y_resource", M2MResourceInstance::FLOAT,
+                                                    M2MBase::GET_ALLOWED, 0, true, NULL, NULL);
+    accel_z_res = mbedClient.add_cloud_resource(3313, 0, 5704, "accel_z_resource", M2MResourceInstance::FLOAT,
+                                                    M2MBase::GET_ALLOWED, 0, true, NULL, NULL);
+    distance_res = mbedClient.add_cloud_resource(3330, 0, 5700, "distance_resource", M2MResourceInstance::FLOAT,
+                                                        M2MBase::GET_ALLOWED, 0, true, NULL, NULL);
+
+    // Vendor defined object, sample frequency resource
+    sample_rate_res = mbedClient.add_cloud_resource(3308, 0, 5900, "Sample Time", M2MResourceInstance::FLOAT,
+                                                        M2MBase::GET_PUT_ALLOWED, 0, true, (void *)sample_time_updated, NULL);
+    sample_rate_res->set_value_float(sample_time_ms / 1000.0);
+
     // Create resource for button count. Path of this resource will be: 3200/0/5501.
     button_res = mbedClient.add_cloud_resource(3200, 0, 5501, "button_resource", M2MResourceInstance::INTEGER,
                               M2MBase::GET_ALLOWED, 0, true, NULL, (void*)notification_status_callback);
@@ -287,6 +331,26 @@ void main_application(void)
 
     // Check if client is registering or registered, if true sleep and repeat.
     while (mbedClient.is_register_called()) {
+      /**
+        * Sample sensors
+        */
+        float distance;
+        float ax;
+        float ay;
+        float az;
+        vl53l0x.get_measurement(range_single_shot_polling, &ToF_data);
+        distance = ToF_data.RangeMilliMeter;
+        ax = icm20602.getAccXvalue(&i2c);
+        ay = icm20602.getAccYvalue(&i2c);
+        az = icm20602.getAccZvalue(&i2c);
+        si7021.measure(&i2c);
+
+        //printf("x=%f, y=%f, z=%f, d=%f\r\n", ax, ay, az, distance);
+
+        distance_res->set_value_float(distance);
+        accel_x_res->set_value_float(ax);
+        accel_y_res->set_value_float(ay);
+        accel_z_res->set_value_float(az);
         mcc_platform_do_wait(100);
     }
 
